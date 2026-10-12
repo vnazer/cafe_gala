@@ -1,4 +1,4 @@
-import { sql, DAY, json } from '../lib/db.js';
+import { sql, DAY, json } from './_db.js';
 
 const ORDER = /^orders\/[A-Za-z0-9_-]{1,64}$/;
 const CLOSING = /^closings\/(\d{4}-\d{2}-\d{2})$/;

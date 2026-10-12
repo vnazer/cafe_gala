@@ -1,4 +1,4 @@
-import { sql, DAY, json } from '../lib/db.js';
+import { sql, DAY, json } from './_db.js';
 
 // GET /api/sync?since=<rev>&days=YYYY-MM-DD,YYYY-MM-DD
 // since=0 → foto completa de esos días (sin borrados) + menú.
