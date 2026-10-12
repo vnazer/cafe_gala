@@ -492,11 +492,13 @@ const usedPagers = () => { const m = {}; activeOrders().forEach(o => { if (o.pag
 const product = id => S.menu.products.find(p => p.id === id);
 const nextNumber = () => ordersOf(S.today).reduce((mx, o) => Math.max(mx, o.n || 0), 0) + 1;
 
-/* ---------------- storage: cloud (shared db) or this device ---------------- */
+/* ---------------- storage: cloud (Neon vía /api) or this device ---------------- */
 const LS_KEY = 'galacafe.v1';
 const local = {orders:{}, menu:null, closings:{}};
 let bc = null;
-const Store = {db:null, unsubs:[], daySubs:{}, chains:{}};
+const API = 'api/';
+const POLL_MS = 1500;
+const Store = {days:new Set(), cursor:0, revs:{}, pending:{}, chains:{}, timer:null, polling:false, fails:0};
 
 function lsRead(){ try { const v = JSON.parse(localStorage.getItem(LS_KEY)); if (v && typeof v === 'object') { local.orders = v.orders || {}; local.menu = v.menu || null; local.closings = v.closings || {}; return true; } } catch (e) {} return false; }
 function lsWrite(){ try { localStorage.setItem(LS_KEY, JSON.stringify(local)); } catch (e) {} try { bc && bc.postMessage('sync'); } catch (e) {} }
@@ -517,80 +519,111 @@ function startLocal(seedDemo){
   ordersChanged(true); renderAll();
 }
 
+async function apiSync(since, days){
+  const r = await fetch(API + 'sync?since=' + since + '&days=' + days.join(','), {cache:'no-store'});
+  const j = await r.json().catch(() => null);
+  if (!r.ok || !j || !Array.isArray(j.docs)) throw Object.assign(new Error((j && j.error) || 'HTTP ' + r.status), {code:'unavailable'});
+  return j;
+}
+async function apiWrite(body){
+  let r;
+  try { r = await fetch(API + 'write', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(body)}); }
+  catch (e) { throw Object.assign(new Error('sin conexión'), {code:'unavailable'}); }
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw Object.assign(new Error(j.error || 'HTTP ' + r.status), {code:r.status >= 500 || r.status === 429 ? 'unavailable' : (j.code || 'rejected')});
+  return j;
+}
 async function startCloud(){
-  if (!window.claude || typeof window.claude.use !== 'function') return false;
-  let db = null, user = null;
-  try { [db, user] = await Promise.all([window.claude.use('db'), window.claude.use('user')]); } catch (e) { return false; }
-  if (!db) return false;
-  let can = null;
-  try { can = user ? await user.can('data.write') : null; } catch (e) {}
-  if (can === false || S.mode === 'local') return false;
-  Store.db = db; S.mode = 'cloud'; setSync();
-  Store.unsubs.push(db.doc('config/menu').onSnapshot(s => {
-    S.menu = normalizeMenu(s.exists ? s.data() : null);
-    if (S.view === 'menu' && !S.menuDirty) S.menuDraft = null;
-    renderAll();
-  }, dbErr));
-  watchDay(S.today);
+  if (!/^https?:$/.test(location.protocol)) return false;
+  let j;
+  try { j = await apiSync(0, [S.today]); } catch (e) { return false; }
+  if (S.mode === 'local') return false;
+  S.mode = 'cloud'; Store.days.add(S.today); Store.cursor = j.rev;
+  applyDocs(j, [S.today]); setSync(); ordersChanged(true);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') poll(); });
+  window.addEventListener('online', () => poll());
+  Store.timer = setTimeout(poll, POLL_MS);
   return true;
 }
-function watchDay(day){
-  if (S.mode !== 'cloud' || Store.daySubs[day]) return;
-  const db = Store.db;
-  Store.daySubs[day] = [
-    db.collection('orders').where('day', '==', day).onSnapshot(snap => {
-      const m = {}; snap.docs.forEach(d => { m[d.id] = d.data(); });
-      S.byDay[day] = m;
-      if (day === S.today) ordersChanged();
-      renderAll();
-    }, dbErr),
-    db.doc('closings/' + day).onSnapshot(s => {
-      S.closings[day] = s.exists ? clone(s.data()) : {};
-      if (S.view === 'cierre' && day === S.reportDay && !(document.activeElement && document.activeElement.closest('.recon'))) renderCierre();
-    }, dbErr)
-  ];
+async function poll(){
+  if (S.mode !== 'cloud' || Store.polling) return;
+  clearTimeout(Store.timer); Store.polling = true;
+  try {
+    applyDocs(await apiSync(Store.cursor, [...Store.days]));
+    if (Store.fails) { Store.fails = 0; setSync(); }
+  } catch (e) {
+    if (++Store.fails === 3) { setSync(); toast('Conexión inestable, reintentando…'); }
+  }
+  Store.polling = false;
+  const wait = document.visibilityState === 'hidden' ? 5000 : Store.fails ? Math.min(10000, POLL_MS * (1 + Store.fails)) : POLL_MS;
+  Store.timer = setTimeout(poll, wait);
 }
-function unwatchDay(day){ (Store.daySubs[day] || []).forEach(u => { try { u(); } catch (e) {} }); delete Store.daySubs[day]; }
-function dbErr(e){
-  if (e && (e.code === 'revoked' || e.code === 'not_granted' || e.code === 'capability_disabled')) fallbackLocal('Se perdió la conexión con la nube. Seguimos en este dispositivo.');
-  else if (e && e.code === 'unavailable') toast('Conexión inestable, reintentando…');
-}
-let fellBack = false;
-function fallbackLocal(msg){
-  if (fellBack) return; fellBack = true;
-  Store.unsubs.forEach(u => { try { u(); } catch (e) {} }); Object.keys(Store.daySubs).forEach(unwatchDay);
-  Store.db = null; toast(msg); startLocal(false);
-}
-function queue(path, fn){
-  const prev = Store.chains[path] || Promise.resolve();
-  const p = prev.then(fn).catch(e => {
-    if (e && e.code === 'invalid_argument' && S.mode === 'cloud') fallbackLocal('Esta cuenta no puede guardar en la nube. Los datos quedan en este dispositivo.');
-    else if (e && e.code === 'quota_exceeded') toast('Se llenó el espacio de datos. Exporta y borra días antiguos.');
-    else if (e && e.code === 'unavailable') { return new Promise(r => setTimeout(r, 400 + Math.random() * 600)).then(fn).catch(() => toast('No se pudo guardar. Revisa la conexión.')); }
-    else toast('No se pudo guardar: ' + ((e && e.message) || 'error'));
+// Aplica documentos del servidor. fullDays = esos días vienen completos (reemplazan lo que hay).
+// Los documentos con escrituras propias en curso se ignoran: el siguiente sondeo los trae ya confirmados.
+function applyDocs(j, fullDays){
+  let orders = false, menu = false;
+  const touched = new Set(fullDays || []);
+  (fullDays || []).forEach(d => {
+    const keep = {}; Object.values(S.byDay[d] || {}).forEach(o => { if (Store.pending['orders/' + o.id]) keep[o.id] = o; });
+    S.byDay[d] = keep; orders = true;
   });
+  j.docs.forEach(d => {
+    if (Store.pending[d.path] || (!fullDays && Store.revs[d.path] === d.rev)) return;
+    Store.revs[d.path] = d.rev;
+    if (d.coll === 'config') {
+      if (d.path === 'config/menu' && !d.deleted) { S.menu = normalizeMenu(d.data); if (S.view === 'menu' && !S.menuDirty) S.menuDraft = null; menu = true; }
+    } else if (d.coll === 'orders') {
+      const id = d.path.slice(7), cur = Object.assign({}, S.byDay[d.day]);
+      if (d.deleted) delete cur[id]; else cur[id] = d.data;
+      S.byDay[d.day] = cur; orders = true; touched.add(d.day);
+    } else if (d.coll === 'closings' && !closingTimers[d.day]) {
+      S.closings[d.day] = d.deleted ? {} : clone(d.data);
+      if (S.view === 'cierre' && d.day === S.reportDay && !(document.activeElement && document.activeElement.closest('.recon'))) renderCierre();
+    }
+  });
+  if (!fullDays) Store.cursor = Math.max(Store.cursor, Number(j.rev) || 0);
+  if (orders && touched.has(S.today)) ordersChanged();
+  if (orders || menu) renderAll();
+}
+function watchDay(day){
+  if (S.mode !== 'cloud' || Store.days.has(day)) return;
+  Store.days.add(day);
+  apiSync(0, [day]).then(j => applyDocs(j, [day])).catch(() => { Store.days.delete(day); toast('No se pudo cargar ese día. Revisa la conexión.'); });
+}
+function unwatchDay(day){ if (day !== S.today) Store.days.delete(day); }
+function queue(path, fn){
+  Store.pending[path] = (Store.pending[path] || 0) + 1;
+  const attempt = n => fn().catch(e => {
+    if (e && e.code === 'unavailable' && n < 6) return new Promise(r => setTimeout(r, Math.min(8000, 500 * 2 ** n))).then(() => attempt(n + 1));
+    throw e;
+  });
+  const prev = Store.chains[path] || Promise.resolve();
+  const p = prev.then(() => attempt(0)).catch(e => {
+    if (e && e.code === 'unavailable') toast('No se pudo guardar. Revisa la conexión.');
+    else toast('No se pudo guardar: ' + ((e && e.message) || 'error'));
+  }).finally(() => { if (!--Store.pending[path]) delete Store.pending[path]; });
   Store.chains[path] = p; return p;
 }
 function deepMerge(t, s){ Object.keys(s).forEach(k => { const v = s[k]; if (v && typeof v === 'object' && !Array.isArray(v) && t[k] && typeof t[k] === 'object' && !Array.isArray(t[k])) deepMerge(t[k], v); else t[k] = v; }); return t; }
 
 function putOrder(o){
-  if (S.mode === 'cloud') { (S.byDay[o.day] = Object.assign({}, S.byDay[o.day]))[o.id] = o; return queue('orders/' + o.id, () => Store.db.doc('orders/' + o.id).set(o)); }
+  if (S.mode === 'cloud') { const path = 'orders/' + o.id; (S.byDay[o.day] = Object.assign({}, S.byDay[o.day]))[o.id] = o; return queue(path, () => apiWrite({op:'set', path, day:o.day, data:o})); }
   local.orders[o.id] = o; lsWrite(); localToState(); return Promise.resolve();
 }
 function patchOrder(o, patch){
   const cur = deepMerge(clone(o), patch);
   (S.byDay[o.day] = Object.assign({}, S.byDay[o.day]))[o.id] = cur;
-  if (S.mode === 'cloud') return queue('orders/' + o.id, () => Store.db.doc('orders/' + o.id).update(patch));
+  if (S.mode === 'cloud') { const path = 'orders/' + o.id; return queue(path, () => apiWrite({op:'patch', path, patch})); }
   local.orders[o.id] = cur; lsWrite(); return Promise.resolve();
 }
 function removeOrder(o){
   if (S.byDay[o.day]) { S.byDay[o.day] = Object.assign({}, S.byDay[o.day]); delete S.byDay[o.day][o.id]; }
-  if (S.mode === 'cloud') return queue('orders/' + o.id, () => Store.db.doc('orders/' + o.id).delete());
+  if (S.mode === 'cloud') { const path = 'orders/' + o.id; return queue(path, () => apiWrite({op:'delete', path})); }
   delete local.orders[o.id]; lsWrite(); return Promise.resolve();
 }
 function saveMenu(m){
   S.menu = normalizeMenu(m);
-  if (S.mode === 'cloud') return queue('config/menu', () => Store.db.doc('config/menu').set(clone(S.menu)));
+  if (S.mode === 'cloud') { const data = clone(S.menu); return queue('config/menu', () => apiWrite({op:'set', path:'config/menu', data})); }
   local.menu = clone(S.menu); lsWrite(); return Promise.resolve();
 }
 const closingTimers = {};
@@ -598,19 +631,20 @@ function saveClosing(day, data){
   S.closings[day] = data;
   clearTimeout(closingTimers[day]);
   closingTimers[day] = setTimeout(() => {
-    if (S.mode === 'cloud') queue('closings/' + day, () => Store.db.doc('closings/' + day).set(clone(data)));
+    delete closingTimers[day];
+    if (S.mode === 'cloud') { const path = 'closings/' + day, body = clone(data); queue(path, () => apiWrite({op:'set', path, day, data:body})); }
     else { local.closings[day] = clone(data); lsWrite(); }
   }, 700);
 }
 
 function setSync(){
   const el = $('#sync'), t = el.querySelector('span');
-  el.className = 'sync ' + (S.mode === 'cloud' ? 'live' : S.mode === 'local' ? 'local' : '');
-  t.textContent = S.mode === 'cloud' ? 'Sincronizado en vivo' : S.mode === 'local' ? 'Modo demo · este dispositivo' : 'Conectando…';
+  const off = S.mode === 'cloud' && Store.fails >= 3;
+  el.className = 'sync ' + (off ? '' : S.mode === 'cloud' ? 'live' : S.mode === 'local' ? 'local' : '');
+  t.textContent = off ? 'Reconectando…' : S.mode === 'cloud' ? 'Sincronizado en vivo' : S.mode === 'local' ? 'Modo demo · este dispositivo' : 'Conectando…';
   el.title = S.mode === 'cloud' ? 'Caja, barra y cierre comparten los datos en tiempo real entre dispositivos.' : 'Los datos se guardan en este navegador. Abre Caja y Barra en dos pestañas para probar el flujo.';
 }
 
-/* ---------------- new-order detection (barra chime) ---------------- */
 function ordersChanged(initial){
   const ids = new Set(ordersOf(S.today).map(o => o.id));
   if (S.seen && !initial) {
